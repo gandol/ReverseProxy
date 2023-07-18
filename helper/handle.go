@@ -1,24 +1,25 @@
-package main
+package helper
 
 import (
-	"net/http"
-	"net/url"
-	"net/http/httputil"
-	"log"
-	"net"
-	"time"
 	"context"
 	"github.com/bogdanovich/dns_resolver"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
+	"time"
 )
 
-type handle struct {
-	reverseProxy string
+type Handle struct {
+	ReverseProxy string
+	Ip           string
 }
 
-func (this *handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Println(r.RemoteAddr + " " + r.Method + " " + r.URL.String() + " " + r.Proto + " " + r.UserAgent())
-	remote, err := url.Parse(this.reverseProxy)
+	remote, err := url.Parse(this.ReverseProxy)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -29,16 +30,16 @@ func (this *handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	http.DefaultTransport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		remote := strings.Split(addr, ":")
-		if cmd.ip == "" {
+		if this.Ip == "" {
 			resolver := dns_resolver.New([]string{"114.114.114.114", "114.114.115.115", "119.29.29.29", "223.5.5.5", "8.8.8.8", "208.67.222.222", "208.67.220.220"})
 			resolver.RetryTimes = 5
 			ip, err := resolver.LookupHost(remote[0])
 			if err != nil {
 				log.Println(err)
 			}
-			cmd.ip = ip[0].String()
+			this.Ip = ip[0].String()
 		}
-		addr = cmd.ip + ":" + remote[1]
+		addr = this.Ip + ":" + remote[1]
 		return dialer.DialContext(ctx, network, addr)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(remote)
