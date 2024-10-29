@@ -29,7 +29,6 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(muliRemote) == 1 {
 		usedRemote = this.ReverseProxy
 	} else {
-		// generate random number between 0 and len(muliRemote)
 		n := rand.Intn(len(muliRemote))
 		if len(RemoteServers) == 0 {
 			RemoteServers = muliRemote
