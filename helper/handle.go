@@ -2,15 +2,20 @@ package helper
 
 import (
 	"context"
-	"github.com/bogdanovich/dns_resolver"
+	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/bogdanovich/dns_resolver"
 )
+
+var RemoteServers = []string{}
 
 type Handle struct {
 	ReverseProxy string
@@ -19,7 +24,23 @@ type Handle struct {
 
 func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Println(r.RemoteAddr + " " + r.Method + " " + r.URL.String() + " " + r.Proto + " " + r.UserAgent())
-	remote, err := url.Parse(this.ReverseProxy)
+	muliRemote := strings.Split(this.ReverseProxy, "|")
+	usedRemote := ""
+	if len(muliRemote) == 1 {
+		usedRemote = this.ReverseProxy
+	} else {
+		// generate random number between 0 and len(muliRemote)
+		n := rand.Intn(len(muliRemote))
+		if len(RemoteServers) == 0 {
+			RemoteServers = muliRemote
+			usedRemote = muliRemote[n]
+		} else {
+			usedRemote = RemoteServers[n]
+		}
+
+	}
+	fmt.Println(usedRemote)
+	remote, err := url.Parse(usedRemote)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -43,6 +64,22 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return dialer.DialContext(ctx, network, addr)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(remote)
+	proxy.ModifyResponse = func(response *http.Response) error {
+		statusCode := response.StatusCode
+		if statusCode == 429 {
+			if len(RemoteServers) == 1 {
+				RemoteServers = muliRemote
+				return nil
+			}
+			for i, v := range RemoteServers {
+				if v == remote.Host {
+					RemoteServers = append(RemoteServers[:i], RemoteServers[i+1:]...)
+				}
+			}
+		}
+		return nil
+	}
 	r.Host = remote.Host
 	proxy.ServeHTTP(w, r)
+
 }
