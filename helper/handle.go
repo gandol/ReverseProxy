@@ -17,6 +17,13 @@ import (
 
 var RemoteServers = []string{}
 
+type DeletedRemoteServer struct {
+	RemoteServer string
+	DeletedAt    time.Time
+}
+
+var DeletedRemoteServers = []DeletedRemoteServer{}
+
 type Handle struct {
 	ReverseProxy string
 	Ip           string
@@ -38,6 +45,14 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 	}
+
+	for _, v := range DeletedRemoteServers {
+		if v.RemoteServer == usedRemote && time.Now().Sub(v.DeletedAt) > 12*time.Hour {
+			RemoteServers = append(RemoteServers, v.RemoteServer)
+			DeletedRemoteServers = append(DeletedRemoteServers[:0], DeletedRemoteServers[1:]...)
+		}
+	}
+
 	fmt.Println(usedRemote)
 	remote, err := url.Parse(usedRemote)
 	if err != nil {
@@ -73,6 +88,7 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			for i, v := range RemoteServers {
 				if v == remote.Host {
 					RemoteServers = append(RemoteServers[:i], RemoteServers[i+1:]...)
+					DeletedRemoteServers = append(DeletedRemoteServers, DeletedRemoteServer{RemoteServer: v, DeletedAt: time.Now()})
 				}
 			}
 		}
