@@ -3,7 +3,10 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"proxyGolang/helper"
+	"syscall"
 )
 
 var Cmd helper.Cmd
@@ -14,11 +17,11 @@ func StartServer(bind string, remote string, ip string) {
 	h := &helper.Handle{ReverseProxy: remote}
 	srv.Addr = bind
 	srv.Handler = h
-	//go func() {
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalln("ListenAndServe: ", err)
-	}
-	//}()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatalln("ListenAndServe: ", err)
+		}
+	}()
 }
 
 func StopServer() {
@@ -30,4 +33,12 @@ func StopServer() {
 func main() {
 	Cmd = helper.ParseCmd()
 	StartServer(Cmd.Bind, Cmd.Remote, Cmd.Ip)
+
+	// Wait for termination signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	StopServer()
+	log.Println("Server gracefully stopped")
 }

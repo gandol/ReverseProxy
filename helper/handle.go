@@ -30,7 +30,7 @@ type Handle struct {
 }
 
 func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Println(r.RemoteAddr + " " + r.Method + " " + r.URL.String() + " " + r.Proto + " " + r.UserAgent())
+	fmt.Println(r.RemoteAddr + " " + r.Method + " " + r.URL.String() + " " + r.Proto + " " + r.UserAgent())
 	muliRemote := strings.Split(this.ReverseProxy, "|")
 	usedRemote := ""
 	if len(muliRemote) == 1 {
