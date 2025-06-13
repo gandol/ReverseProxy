@@ -12,9 +12,9 @@ import (
 var Cmd helper.Cmd
 var srv http.Server
 
-func StartServer(bind string, remote string, ip string) {
+func StartServer(bind string, remote string, ip string, headers string, blocked string) {
 	log.Printf("Listening on %s, forwarding to %s", bind, remote)
-	h := &helper.Handle{ReverseProxy: remote}
+	h := &helper.Handle{ReverseProxy: remote, Headers: headers, BlockedFiles: blocked}
 	srv.Addr = bind
 	srv.Handler = h
 	go func() {
@@ -32,7 +32,7 @@ func StopServer() {
 
 func main() {
 	Cmd = helper.ParseCmd()
-	StartServer(Cmd.Bind, Cmd.Remote, Cmd.Ip)
+	StartServer(Cmd.Bind, Cmd.Remote, Cmd.Ip, Cmd.Headers, Cmd.BlockedFiles)
 
 	// Wait for termination signal
 	sigChan := make(chan os.Signal, 1)
