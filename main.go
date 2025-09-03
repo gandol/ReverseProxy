@@ -16,9 +16,9 @@ import (
 var Cmd helper.Cmd
 var srv http.Server
 
-func StartServer(bind string, remote string, ip string, headers string, blocked string) {
+func StartServer(bind string, remote string, ip string, headers string, blocked string, socksProxy string) {
 	log.Printf("Listening on %s, forwarding to %s", bind, remote)
-	h := helper.NewHandle(remote, headers, blocked, "proxy_stats.json")
+	h := helper.NewHandle(remote, headers, blocked, "proxy_stats.json", socksProxy)
 	srv.Addr = bind
 	srv.Handler = h
 	go func() {
@@ -53,13 +53,17 @@ func main() {
 	// Handle daemon mode
 	if Cmd.Daemon {
 		// Create a new process that runs in background
-		cmd := exec.Command(os.Args[0],
+		args := []string{
 			"-l", Cmd.Bind,
 			"-r", Cmd.Remote,
 			"-ip", Cmd.Ip,
 			"-h", Cmd.Headers,
 			"-b", Cmd.BlockedFiles,
-		)
+		}
+		if Cmd.SocksProxy != "" {
+			args = append(args, "-socks", Cmd.SocksProxy)
+		}
+		cmd := exec.Command(os.Args[0], args...)
 
 		// Create log file for daemon output
 		logFile, err := os.OpenFile("proxy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -84,7 +88,7 @@ func main() {
 		return
 	}
 
-	StartServer(Cmd.Bind, Cmd.Remote, Cmd.Ip, Cmd.Headers, Cmd.BlockedFiles)
+	StartServer(Cmd.Bind, Cmd.Remote, Cmd.Ip, Cmd.Headers, Cmd.BlockedFiles, Cmd.SocksProxy)
 
 	// Wait for termination signal
 	sigChan := make(chan os.Signal, 1)

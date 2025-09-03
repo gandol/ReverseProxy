@@ -6,6 +6,7 @@ ReverseProxy in golang with traffic calculation and daily statistics
 - **Daily traffic statistics tracking with date separation**
 - **Blocked requests counting**
 - **Daemon mode for background operation**
+- **SOCKS proxy support for upstream connections**
 - Server failover and load balancing
 - Custom headers support
 - File extension blocking
@@ -25,12 +26,51 @@ ReverseProxy in golang with traffic calculation and daily statistics
 	        block file extensions (e.g., exe|zip)
 	  -d bool
 	        run as daemon in background (default false)
+	  -socks string
+	        SOCKS proxy address (e.g., socks5://127.0.0.1:1080)
 
 ### Standard Mode (blocks terminal):
 	./proxyGolang -l "0.0.0.0:8081" -r "https://www.baidu.com"
 
 ### Daemon Mode (runs in background):
 	./proxyGolang -d -l "0.0.0.0:8081" -r "https://www.baidu.com"
+
+### With SOCKS Proxy:
+	./proxyGolang -l "0.0.0.0:8081" -r "https://www.baidu.com" -socks "socks5://127.0.0.1:1080"
+
+## SOCKS Proxy Support
+
+The reverse proxy now supports routing upstream connections through a SOCKS proxy. This feature allows you to:
+
+- Route backend connections through SOCKS4, SOCKS4a, or SOCKS5 proxies
+- Use SOCKS proxy for better network routing or privacy
+- Access geo-restricted backend services
+- Work with existing SOCKS proxy infrastructure
+
+### SOCKS Proxy URL Formats:
+
+**Standard URL Format:**
+- `socks5://username:password@host:port` - SOCKS5 with authentication
+- `socks5://host:port` - SOCKS5 without authentication  
+- `socks4://host:port` - SOCKS4 proxy
+- `socks4a://host:port` - SOCKS4a proxy
+
+**Custom Format:**
+- `socks5:host:port:username:password` - SOCKS5 with authentication
+- `socks4:host:port:username:password` - SOCKS4 with authentication
+- `socks4a:host:port:username:password` - SOCKS4a with authentication
+
+### Examples:
+```bash
+# Standard URL format
+./proxyGolang -l "0.0.0.0:8081" -r "https://example.com" -socks "socks5://user:pass@127.0.0.1:1080"
+
+# Custom format (useful for proxy services)
+./proxyGolang -l "0.0.0.0:8081" -r "https://example.com" -socks "socks5:as.proxys5.net:6200:59739141-zone-custom-sessid-rT8p2Grd-sessTime-15:kNSTvoc4"
+
+# SOCKS4 with custom format
+./proxyGolang -l "0.0.0.0:8081" -r "https://example.com" -socks "socks4:proxy.example.com:1080:username:password"
+```
 
 ## Daily Traffic Statistics
 
@@ -47,6 +87,8 @@ The proxy now tracks **daily traffic statistics** with date separation, includin
 Statistics are automatically saved to `proxy_stats.json` every minute with daily separation. Stats are organized by date and persist across server restarts.
 
 ### Accessing Statistics
+
+```
 
 #### Current Day Stats
 Visit `http://your-proxy-host:port/stats` to get **current day only** traffic statistics in JSON format:

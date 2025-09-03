@@ -9,6 +9,7 @@ type Cmd struct {
 	Headers      string
 	BlockedFiles string
 	Daemon       bool
+	SocksProxy   string
 }
 
 func ParseCmd() Cmd {
@@ -19,6 +20,7 @@ func ParseCmd() Cmd {
 	flag.StringVar(&cmd.Headers, "h", "", "custom headers to add to requests")
 	flag.StringVar(&cmd.BlockedFiles, "b", "", "block file extensions (e.g., exe|zip)")
 	flag.BoolVar(&cmd.Daemon, "d", false, "run as daemon in background")
+	flag.StringVar(&cmd.SocksProxy, "socks", "", "SOCKS proxy address (URL format: socks5://user:pass@host:port or custom format: socks5:host:port:username:password)")
 	flag.Parse()
 	return cmd
 }

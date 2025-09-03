@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/bogdanovich/dns_resolver"
+	"golang.org/x/net/proxy"
 )
 
 // ServerManager handles server selection, rotation, and failover
@@ -172,6 +173,7 @@ type Handle struct {
 	Ip           string
 	Headers      string
 	BlockedFiles string
+	SocksProxy   string
 	// Traffic counters
 	RequestCount  int64
 	IncomingBytes int64
@@ -454,11 +456,12 @@ func (h *Handle) StopPeriodicSave() {
 }
 
 // NewHandle creates a new Handle with stats persistence
-func NewHandle(reverseProxy, headers, blockedFiles, statsFile string) *Handle {
+func NewHandle(reverseProxy, headers, blockedFiles, statsFile, socksProxy string) *Handle {
 	h := &Handle{
 		ReverseProxy: reverseProxy,
 		Headers:      headers,
 		BlockedFiles: blockedFiles,
+		SocksProxy:   socksProxy,
 		statsFile:    statsFile,
 	}
 
@@ -471,6 +474,114 @@ func NewHandle(reverseProxy, headers, blockedFiles, statsFile string) *Handle {
 	h.startPeriodicSave()
 
 	return h
+}
+
+// dialWithDNSResolution handles DNS resolution and IP caching for direct connections
+func (h *Handle) dialWithDNSResolution(ctx context.Context, network, addr string, dialer *net.Dialer) (net.Conn, error) {
+	remoteAddr := strings.Split(addr, ":")
+	hostName := remoteAddr[0]
+
+	// Check if we already have this IP cached
+	ipCacheMutex.RLock()
+	cachedIP, exists := serverIPCache[hostName]
+	ipCacheMutex.RUnlock()
+
+	// If not cached or IP is empty, resolve it
+	if !exists || cachedIP == "" {
+		resolver := dns_resolver.New([]string{"114.114.114.114", "114.114.115.115", "119.29.29.29", "223.5.5.5", "8.8.8.8", "208.67.222.222", "208.67.220.220"})
+		resolver.RetryTimes = 5
+
+		ips, err := resolver.LookupHost(hostName)
+		if err != nil {
+			log.Println("DNS resolution error:", err)
+			return nil, err
+		}
+
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no IP addresses found for host: %s", hostName)
+		}
+
+		// Cache the resolved IP
+		ipCacheMutex.Lock()
+		serverIPCache[hostName] = ips[0].String()
+		cachedIP = serverIPCache[hostName]
+		ipCacheMutex.Unlock()
+	}
+
+	// Use the resolved/cached IP
+	addr = cachedIP + ":" + remoteAddr[1]
+	return dialer.DialContext(ctx, network, addr)
+}
+
+// parseCustomSOCKSFormat parses custom SOCKS format: type:host:port:username:password
+func (h *Handle) parseCustomSOCKSFormat(socksConfig string, baseDialer *net.Dialer) (proxy.Dialer, error) {
+	parts := strings.Split(socksConfig, ":")
+	if len(parts) != 5 {
+		return nil, fmt.Errorf("invalid SOCKS format, expected type:host:port:username:password, got: %s", socksConfig)
+	}
+
+	socksType := parts[0]
+	host := parts[1]
+	port := parts[2]
+	username := parts[3]
+	password := parts[4]
+
+	log.Printf("Parsing SOCKS proxy - Type: %s, Host: %s, Port: %s",
+		socksType, host, port)
+
+	// Validate SOCKS type
+	if socksType != "socks5" && socksType != "socks4" && socksType != "socks4a" {
+		return nil, fmt.Errorf("unsupported SOCKS type: %s", socksType)
+	}
+
+	// For SOCKS5, try to create a direct SOCKS5 dialer with explicit auth
+	if socksType == "socks5" && username != "" && password != "" {
+		// Try creating a SOCKS5 dialer with Auth
+		auth := &proxy.Auth{
+			User:     username,
+			Password: password,
+		}
+
+		// Create the proxy address
+		proxyAddr := net.JoinHostPort(host, port)
+
+		dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, baseDialer)
+		if err != nil {
+			log.Printf("Failed to create SOCKS5 dialer with explicit auth: %v", err)
+
+			// Fallback to URL-based approach
+			proxyURL := &url.URL{
+				Scheme: socksType,
+				User:   url.UserPassword(username, password),
+				Host:   proxyAddr,
+			}
+			log.Printf("Trying fallback URL-based SOCKS5 approach")
+			return proxy.FromURL(proxyURL, baseDialer)
+		}
+
+		log.Printf("Created SOCKS5 dialer with explicit auth for %s:%s", host, port)
+		return dialer, nil
+	}
+
+	// Fallback to URL-based approach for other cases
+	var proxyURL *url.URL
+	if username != "" && password != "" {
+		proxyURL = &url.URL{
+			Scheme: socksType,
+			User:   url.UserPassword(username, password),
+			Host:   net.JoinHostPort(host, port),
+		}
+		log.Printf("Created SOCKS URL with auth: %s://[username]@%s", socksType, net.JoinHostPort(host, port))
+	} else {
+		proxyURL = &url.URL{
+			Scheme: socksType,
+			Host:   net.JoinHostPort(host, port),
+		}
+		log.Printf("Created SOCKS URL without auth: %s://%s", socksType, net.JoinHostPort(host, port))
+	}
+
+	// Create SOCKS dialer
+	return proxy.FromURL(proxyURL, baseDialer)
 }
 
 func (h *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -536,46 +647,68 @@ func (h *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a custom transport
-	customTransport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			remoteAddr := strings.Split(addr, ":")
-			hostName := remoteAddr[0]
+	var customTransport *http.Transport
 
-			// Check if we already have this IP cached
-			ipCacheMutex.RLock()
-			cachedIP, exists := serverIPCache[hostName]
-			ipCacheMutex.RUnlock()
+	// Check if SOCKS proxy is configured
+	if h.SocksProxy != "" {
+		// Parse SOCKS proxy - support both URL format and custom format
+		var socksDialer proxy.Dialer
+		var err error
 
-			// If not cached or IP is empty, resolve it
-			if !exists || cachedIP == "" {
-				resolver := dns_resolver.New([]string{"114.114.114.114", "114.114.115.115", "119.29.29.29", "223.5.5.5", "8.8.8.8", "208.67.222.222", "208.67.220.220"})
-				resolver.RetryTimes = 5
-
-				ips, err := resolver.LookupHost(hostName)
-				if err != nil {
-					log.Println("DNS resolution error:", err)
-					return nil, err
-				}
-
-				if len(ips) == 0 {
-					return nil, fmt.Errorf("no IP addresses found for host: %s", hostName)
-				}
-
-				// Cache the resolved IP
-				ipCacheMutex.Lock()
-				serverIPCache[hostName] = ips[0].String()
-				cachedIP = serverIPCache[hostName]
-				ipCacheMutex.Unlock()
+		// Check if it's in custom format: type:host:port:username:password
+		// Custom format has exactly 5 parts when split by ":"
+		parts := strings.Split(h.SocksProxy, ":")
+		if len(parts) == 5 && (parts[0] == "socks5" || parts[0] == "socks4" || parts[0] == "socks4a") {
+			// Parse custom format
+			socksDialer, err = h.parseCustomSOCKSFormat(h.SocksProxy, dialer)
+		} else {
+			// Try URL format
+			proxyURL, urlErr := url.Parse(h.SocksProxy)
+			if urlErr != nil {
+				log.Printf("Invalid SOCKS proxy format: %v", urlErr)
+				err = urlErr
+			} else {
+				// Create SOCKS dialer from URL
+				socksDialer, err = proxy.FromURL(proxyURL, dialer)
 			}
+		}
 
-			// Use the resolved/cached IP
-			addr = cachedIP + ":" + remoteAddr[1]
-			return dialer.DialContext(ctx, network, addr)
-		},
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		if err != nil {
+			log.Printf("Failed to create SOCKS dialer: %v", err)
+			// Fall back to direct connection
+			customTransport = &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return h.dialWithDNSResolution(ctx, network, addr, dialer)
+				},
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+		} else {
+			// Use SOCKS proxy
+			customTransport = &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					// For SOCKS proxy, we can directly use the hostname without DNS resolution
+					return socksDialer.Dial(network, addr)
+				},
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+		}
+	} else {
+		// Direct connection without SOCKS proxy
+		customTransport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return h.dialWithDNSResolution(ctx, network, addr, dialer)
+			},
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(remote)
