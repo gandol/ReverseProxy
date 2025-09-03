@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"proxyGolang/helper"
 	"syscall"
+	"time"
 )
 
 var Cmd helper.Cmd
@@ -14,7 +16,7 @@ var srv http.Server
 
 func StartServer(bind string, remote string, ip string, headers string, blocked string) {
 	log.Printf("Listening on %s, forwarding to %s", bind, remote)
-	h := &helper.Handle{ReverseProxy: remote, Headers: headers, BlockedFiles: blocked}
+	h := helper.NewHandle(remote, headers, blocked, "proxy_stats.json")
 	srv.Addr = bind
 	srv.Handler = h
 	go func() {
@@ -25,7 +27,20 @@ func StartServer(bind string, remote string, ip string, headers string, blocked 
 }
 
 func StopServer() {
-	if err := srv.Shutdown(nil); err != nil {
+	// Stop periodic stats saving (this will trigger a final save in the goroutine)
+	if h, ok := srv.Handler.(*helper.Handle); ok {
+		h.StopPeriodicSave()
+
+		// Wait a bit for the periodic goroutine to finish its final save
+		time.Sleep(200 * time.Millisecond)
+
+		// Also save from main thread to ensure it's saved
+		if err := h.SaveStats(); err != nil {
+			log.Printf("Failed to save final stats: %v", err)
+		}
+	}
+
+	if err := srv.Shutdown(context.Background()); err != nil {
 		log.Println(err)
 	}
 }

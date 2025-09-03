@@ -2,6 +2,7 @@ package helper
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -169,6 +172,63 @@ type Handle struct {
 	Ip           string
 	Headers      string
 	BlockedFiles string
+	// Traffic counters
+	RequestCount  int64
+	IncomingBytes int64
+	OutgoingBytes int64
+	BackendBytes  int64
+	mutex         sync.RWMutex
+	// Stats persistence
+	statsFile string
+	stopChan  chan struct{}
+}
+
+// responseWriterWrapper wraps http.ResponseWriter to count bytes written
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	handle *Handle
+}
+
+func (rw *responseWriterWrapper) Write(data []byte) (int, error) {
+	n, err := rw.ResponseWriter.Write(data)
+	if err == nil {
+		rw.handle.mutex.Lock()
+		rw.handle.OutgoingBytes += int64(n)
+		rw.handle.mutex.Unlock()
+	}
+	return n, err
+}
+
+// countingTransport wraps http.RoundTripper to count backend traffic
+type countingTransport struct {
+	transport http.RoundTripper
+	handle    *Handle
+}
+
+func (ct *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Count request body size if present
+	if req.Body != nil {
+		// For simplicity, we'll count the Content-Length header if available
+		if req.ContentLength > 0 {
+			ct.handle.mutex.Lock()
+			ct.handle.BackendBytes += req.ContentLength
+			ct.handle.mutex.Unlock()
+		}
+	}
+
+	resp, err := ct.transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Count response body size if Content-Length is available
+	if resp.ContentLength > 0 {
+		ct.handle.mutex.Lock()
+		ct.handle.BackendBytes += resp.ContentLength
+		ct.handle.mutex.Unlock()
+	}
+
+	return resp, nil
 }
 
 type CleanRemotWithoutPathType struct {
@@ -208,10 +268,173 @@ func BlockFileExtension(exts string, request *http.Request) bool {
 	return false
 }
 
-func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *Handle) GetStats() (int64, int64, int64, int64) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	return h.RequestCount, h.IncomingBytes, h.OutgoingBytes, h.BackendBytes
+}
+
+func (h *Handle) serveStats(w http.ResponseWriter, r *http.Request) {
+	reqCount, inBytes, outBytes, backendBytes := h.GetStats()
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{
+		"requests": %d,
+		"incoming_bytes": %d,
+		"outgoing_bytes": %d,
+		"backend_bytes": %d,
+		"total_bytes": %d
+	}`, reqCount, inBytes, outBytes, backendBytes, inBytes+outBytes+backendBytes)
+}
+
+func (h *Handle) resetStats(w http.ResponseWriter, r *http.Request) {
+	h.mutex.Lock()
+	h.RequestCount = 0
+	h.IncomingBytes = 0
+	h.OutgoingBytes = 0
+	h.BackendBytes = 0
+	h.mutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status": "stats reset"}`)
+}
+
+// StatsData represents the structure for saving/loading stats
+type StatsData struct {
+	RequestCount  int64 `json:"request_count"`
+	IncomingBytes int64 `json:"incoming_bytes"`
+	OutgoingBytes int64 `json:"outgoing_bytes"`
+	BackendBytes  int64 `json:"backend_bytes"`
+	Timestamp     int64 `json:"timestamp"`
+}
+
+func (h *Handle) SaveStats() error {
+	h.mutex.RLock()
+	data := StatsData{
+		RequestCount:  h.RequestCount,
+		IncomingBytes: h.IncomingBytes,
+		OutgoingBytes: h.OutgoingBytes,
+		BackendBytes:  h.BackendBytes,
+		Timestamp:     time.Now().Unix(),
+	}
+	h.mutex.RUnlock()
+
+	// Ensure the directory exists
+	dir := filepath.Dir(h.statsFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %v", dir, err)
+	}
+
+	file, err := os.Create(h.statsFile)
+	if err != nil {
+		return fmt.Errorf("failed to create stats file %s: %v", h.statsFile, err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	if err := encoder.Encode(data); err != nil {
+		return fmt.Errorf("failed to encode stats: %v", err)
+	}
+
+	return nil
+}
+
+func (h *Handle) loadStats() error {
+	file, err := os.Open(h.statsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist, start with zero stats
+			return nil
+		}
+		return fmt.Errorf("failed to open stats file: %v", err)
+	}
+	defer file.Close()
+
+	var data StatsData
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&data); err != nil {
+		return fmt.Errorf("failed to decode stats: %v", err)
+	}
+
+	h.mutex.Lock()
+	h.RequestCount = data.RequestCount
+	h.IncomingBytes = data.IncomingBytes
+	h.OutgoingBytes = data.OutgoingBytes
+	h.BackendBytes = data.BackendBytes
+	h.mutex.Unlock()
+
+	fmt.Printf("Loaded stats from file: %d requests, %d total bytes\n", data.RequestCount, data.IncomingBytes+data.OutgoingBytes+data.BackendBytes)
+	return nil
+}
+
+func (h *Handle) startPeriodicSave() {
+	h.stopChan = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(60 * time.Second) // Save every minute
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := h.SaveStats(); err != nil {
+					log.Printf("Failed to save stats: %v", err)
+				}
+			case <-h.stopChan:
+				// Save one final time before stopping
+				if err := h.SaveStats(); err != nil {
+					log.Printf("Failed to save final stats: %v", err)
+				}
+				return
+			}
+		}
+	}()
+}
+
+func (h *Handle) StopPeriodicSave() {
+	if h.stopChan != nil {
+		close(h.stopChan)
+	}
+}
+
+// NewHandle creates a new Handle with stats persistence
+func NewHandle(reverseProxy, headers, blockedFiles, statsFile string) *Handle {
+	h := &Handle{
+		ReverseProxy: reverseProxy,
+		Headers:      headers,
+		BlockedFiles: blockedFiles,
+		statsFile:    statsFile,
+	}
+
+	// Load existing stats
+	if err := h.loadStats(); err != nil {
+		log.Printf("Warning: Failed to load stats: %v", err)
+	}
+
+	// Start periodic stats saving
+	h.startPeriodicSave()
+
+	return h
+}
+
+func (h *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Handle stats endpoint
+	if r.URL.Path == "/stats" {
+		h.serveStats(w, r)
+		return
+	}
+	if r.URL.Path == "/stats/reset" && r.Method == "POST" {
+		h.resetStats(w, r)
+		return
+	}
+
+	// Count the request
+	h.mutex.Lock()
+	h.RequestCount++
+	h.mutex.Unlock()
+
 	fmt.Println(r.RemoteAddr + " " + r.Method + " " + r.URL.String() + " " + r.Proto + " " + r.UserAgent())
 
-	hasBlockedFile := BlockFileExtension(this.BlockedFiles, r)
+	hasBlockedFile := BlockFileExtension(h.BlockedFiles, r)
 	if hasBlockedFile {
 		fmt.Println("Blocked file extension for URL:", r.URL.String())
 		http.Error(w, "Forbidden", http.StatusForbidden)
@@ -219,7 +442,7 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse the remote servers
-	multiRemote := strings.Split(this.ReverseProxy, "|")
+	multiRemote := strings.Split(h.ReverseProxy, "|")
 
 	// Make sure the global server manager has the current server list
 	globalServerManager.SetOriginalServers(multiRemote)
@@ -241,7 +464,7 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reset IP for this request
-	this.Ip = ""
+	h.Ip = ""
 
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -293,11 +516,14 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(remote)
-	proxy.Transport = customTransport
+	proxy.Transport = &countingTransport{
+		transport: customTransport,
+		handle:    h,
+	}
 
 	// Add custom headers if available
-	if this.Headers != "" {
-		headers := strings.Split(this.Headers, ";")
+	if h.Headers != "" {
+		headers := strings.Split(h.Headers, ";")
 		for _, header := range headers {
 			if strings.Contains(header, ":") {
 				parts := strings.SplitN(header, ":", 2)
@@ -327,5 +553,12 @@ func (this *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Host = remote.Host
-	proxy.ServeHTTP(w, r)
+
+	// Wrap the response writer to count outgoing bytes
+	wrappedWriter := &responseWriterWrapper{
+		ResponseWriter: w,
+		handle:         h,
+	}
+
+	proxy.ServeHTTP(wrappedWriter, r)
 }
