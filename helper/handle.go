@@ -177,6 +177,7 @@ type Handle struct {
 	IncomingBytes int64
 	OutgoingBytes int64
 	BackendBytes  int64
+	BlockedCount  int64
 	mutex         sync.RWMutex
 	// Stats persistence
 	statsFile string
@@ -268,14 +269,14 @@ func BlockFileExtension(exts string, request *http.Request) bool {
 	return false
 }
 
-func (h *Handle) GetStats() (int64, int64, int64, int64) {
+func (h *Handle) GetStats() (int64, int64, int64, int64, int64) {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
-	return h.RequestCount, h.IncomingBytes, h.OutgoingBytes, h.BackendBytes
+	return h.RequestCount, h.IncomingBytes, h.OutgoingBytes, h.BackendBytes, h.BlockedCount
 }
 
 func (h *Handle) serveStats(w http.ResponseWriter, r *http.Request) {
-	reqCount, inBytes, outBytes, backendBytes := h.GetStats()
+	reqCount, inBytes, outBytes, backendBytes, blockedCount := h.GetStats()
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{
@@ -283,8 +284,32 @@ func (h *Handle) serveStats(w http.ResponseWriter, r *http.Request) {
 		"incoming_bytes": %d,
 		"outgoing_bytes": %d,
 		"backend_bytes": %d,
+		"blocked_count": %d,
 		"total_bytes": %d
-	}`, reqCount, inBytes, outBytes, backendBytes, inBytes+outBytes+backendBytes)
+	}`, reqCount, inBytes, outBytes, backendBytes, blockedCount, inBytes+outBytes+backendBytes)
+}
+
+func (h *Handle) serveHistoryStats(w http.ResponseWriter, r *http.Request) {
+	file, err := os.Open(h.statsFile)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"error": "Failed to open stats file"}`)
+		return
+	}
+	defer file.Close()
+
+	var allStats AllStatsData
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&allStats); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"error": "Failed to decode stats"}`)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(allStats)
 }
 
 func (h *Handle) resetStats(w http.ResponseWriter, r *http.Request) {
@@ -293,6 +318,7 @@ func (h *Handle) resetStats(w http.ResponseWriter, r *http.Request) {
 	h.IncomingBytes = 0
 	h.OutgoingBytes = 0
 	h.BackendBytes = 0
+	h.BlockedCount = 0
 	h.mutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -300,24 +326,45 @@ func (h *Handle) resetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // StatsData represents the structure for saving/loading stats
-type StatsData struct {
+type DailyStatsData struct {
 	RequestCount  int64 `json:"request_count"`
 	IncomingBytes int64 `json:"incoming_bytes"`
 	OutgoingBytes int64 `json:"outgoing_bytes"`
 	BackendBytes  int64 `json:"backend_bytes"`
-	Timestamp     int64 `json:"timestamp"`
+	BlockedCount  int64 `json:"blocked_count"`
+}
+
+type AllStatsData struct {
+	DailyStats map[string]*DailyStatsData `json:"daily_stats"`
 }
 
 func (h *Handle) SaveStats() error {
 	h.mutex.RLock()
-	data := StatsData{
+	defer h.mutex.RUnlock()
+
+	today := time.Now().Format("2006-01-02")
+
+	// Read existing data first
+	var allStats AllStatsData
+	if file, err := os.Open(h.statsFile); err == nil {
+		decoder := json.NewDecoder(file)
+		decoder.Decode(&allStats)
+		file.Close()
+	}
+
+	// Initialize if nil
+	if allStats.DailyStats == nil {
+		allStats.DailyStats = make(map[string]*DailyStatsData)
+	}
+
+	// Update today's stats
+	allStats.DailyStats[today] = &DailyStatsData{
 		RequestCount:  h.RequestCount,
 		IncomingBytes: h.IncomingBytes,
 		OutgoingBytes: h.OutgoingBytes,
 		BackendBytes:  h.BackendBytes,
-		Timestamp:     time.Now().Unix(),
+		BlockedCount:  h.BlockedCount,
 	}
-	h.mutex.RUnlock()
 
 	// Ensure the directory exists
 	dir := filepath.Dir(h.statsFile)
@@ -332,7 +379,7 @@ func (h *Handle) SaveStats() error {
 	defer file.Close()
 
 	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(data); err != nil {
+	if err := encoder.Encode(allStats); err != nil {
 		return fmt.Errorf("failed to encode stats: %v", err)
 	}
 
@@ -350,20 +397,30 @@ func (h *Handle) loadStats() error {
 	}
 	defer file.Close()
 
-	var data StatsData
+	var allStats AllStatsData
 	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&data); err != nil {
+	if err := decoder.Decode(&allStats); err != nil {
 		return fmt.Errorf("failed to decode stats: %v", err)
 	}
 
-	h.mutex.Lock()
-	h.RequestCount = data.RequestCount
-	h.IncomingBytes = data.IncomingBytes
-	h.OutgoingBytes = data.OutgoingBytes
-	h.BackendBytes = data.BackendBytes
-	h.mutex.Unlock()
+	// Load today's stats if available
+	today := time.Now().Format("2006-01-02")
+	if allStats.DailyStats != nil && allStats.DailyStats[today] != nil {
+		data := allStats.DailyStats[today]
+		h.mutex.Lock()
+		h.RequestCount = data.RequestCount
+		h.IncomingBytes = data.IncomingBytes
+		h.OutgoingBytes = data.OutgoingBytes
+		h.BackendBytes = data.BackendBytes
+		h.BlockedCount = data.BlockedCount
+		h.mutex.Unlock()
 
-	fmt.Printf("Loaded stats from file: %d requests, %d total bytes\n", data.RequestCount, data.IncomingBytes+data.OutgoingBytes+data.BackendBytes)
+		fmt.Printf("Loaded today's stats from file: %d requests, %d blocked, %d total bytes\n",
+			data.RequestCount, data.BlockedCount, data.IncomingBytes+data.OutgoingBytes+data.BackendBytes)
+	} else {
+		fmt.Println("No stats found for today, starting fresh")
+	}
+
 	return nil
 }
 
@@ -422,8 +479,8 @@ func (h *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStats(w, r)
 		return
 	}
-	if r.URL.Path == "/stats/reset" && r.Method == "POST" {
-		h.resetStats(w, r)
+	if r.URL.Path == "/stats/history" {
+		h.serveHistoryStats(w, r)
 		return
 	}
 
@@ -437,6 +494,12 @@ func (h *Handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hasBlockedFile := BlockFileExtension(h.BlockedFiles, r)
 	if hasBlockedFile {
 		fmt.Println("Blocked file extension for URL:", r.URL.String())
+
+		// Increment blocked count
+		h.mutex.Lock()
+		h.BlockedCount++
+		h.mutex.Unlock()
+
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}

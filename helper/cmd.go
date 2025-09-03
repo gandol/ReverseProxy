@@ -8,6 +8,7 @@ type Cmd struct {
 	Ip           string
 	Headers      string
 	BlockedFiles string
+	Daemon       bool
 }
 
 func ParseCmd() Cmd {
@@ -17,6 +18,7 @@ func ParseCmd() Cmd {
 	flag.StringVar(&cmd.Ip, "ip", "", "reverse proxy addr server ip")
 	flag.StringVar(&cmd.Headers, "h", "", "custom headers to add to requests")
 	flag.StringVar(&cmd.BlockedFiles, "b", "", "block file extensions (e.g., exe|zip)")
+	flag.BoolVar(&cmd.Daemon, "d", false, "run as daemon in background")
 	flag.Parse()
 	return cmd
 }
