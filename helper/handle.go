@@ -280,15 +280,21 @@ func (h *Handle) GetStats() (int64, int64, int64, int64, int64) {
 func (h *Handle) serveStats(w http.ResponseWriter, r *http.Request) {
 	reqCount, inBytes, outBytes, backendBytes, blockedCount := h.GetStats()
 
+	totalBytes := inBytes + outBytes + backendBytes
+
+	response := StatsResponseData{
+		RequestCount: reqCount,
+		IncomingGB:   float64(inBytes) / (1024 * 1024 * 1024),
+		OutgoingGB:   float64(outBytes) / (1024 * 1024 * 1024),
+		BackendGB:    float64(backendBytes) / (1024 * 1024 * 1024),
+		TotalGB:      float64(totalBytes) / (1024 * 1024 * 1024),
+		BlockedCount: blockedCount,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{
-		"requests": %d,
-		"incoming_bytes": %d,
-		"outgoing_bytes": %d,
-		"backend_bytes": %d,
-		"blocked_count": %d,
-		"total_bytes": %d
-	}`, reqCount, inBytes, outBytes, backendBytes, blockedCount, inBytes+outBytes+backendBytes)
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(response)
 }
 
 func (h *Handle) serveHistoryStats(w http.ResponseWriter, r *http.Request) {
@@ -308,10 +314,29 @@ func (h *Handle) serveHistoryStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert to response format (GB only)
+	response := AllStatsResponseData{
+		DailyStats: make(map[string]*StatsResponseData),
+	}
+
+	for date, dailyData := range allStats.DailyStats {
+		if dailyData != nil {
+			totalBytes := dailyData.IncomingBytes + dailyData.OutgoingBytes + dailyData.BackendBytes
+			response.DailyStats[date] = &StatsResponseData{
+				RequestCount: dailyData.RequestCount,
+				IncomingGB:   float64(dailyData.IncomingBytes) / (1024 * 1024 * 1024),
+				OutgoingGB:   float64(dailyData.OutgoingBytes) / (1024 * 1024 * 1024),
+				BackendGB:    float64(dailyData.BackendBytes) / (1024 * 1024 * 1024),
+				TotalGB:      float64(totalBytes) / (1024 * 1024 * 1024),
+				BlockedCount: dailyData.BlockedCount,
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
-	encoder.Encode(allStats)
+	encoder.Encode(response)
 }
 
 func (h *Handle) resetStats(w http.ResponseWriter, r *http.Request) {
@@ -329,15 +354,30 @@ func (h *Handle) resetStats(w http.ResponseWriter, r *http.Request) {
 
 // StatsData represents the structure for saving/loading stats
 type DailyStatsData struct {
-	RequestCount  int64 `json:"request_count"`
+	RequestCount  int64 `json:"requests"`
 	IncomingBytes int64 `json:"incoming_bytes"`
 	OutgoingBytes int64 `json:"outgoing_bytes"`
 	BackendBytes  int64 `json:"backend_bytes"`
 	BlockedCount  int64 `json:"blocked_count"`
+	TotalBytes    int64 `json:"total_bytes"`
 }
 
 type AllStatsData struct {
 	DailyStats map[string]*DailyStatsData `json:"daily_stats"`
+}
+
+// Response structs for API endpoints (GB only, no bytes)
+type StatsResponseData struct {
+	RequestCount int64   `json:"requests"`
+	IncomingGB   float64 `json:"incoming_gb"`
+	OutgoingGB   float64 `json:"outgoing_gb"`
+	BackendGB    float64 `json:"backend_gb"`
+	TotalGB      float64 `json:"total_gb"`
+	BlockedCount int64   `json:"blocked_count"`
+}
+
+type AllStatsResponseData struct {
+	DailyStats map[string]*StatsResponseData `json:"daily_stats"`
 }
 
 func (h *Handle) SaveStats() error {
@@ -366,6 +406,7 @@ func (h *Handle) SaveStats() error {
 		OutgoingBytes: h.OutgoingBytes,
 		BackendBytes:  h.BackendBytes,
 		BlockedCount:  h.BlockedCount,
+		TotalBytes:    h.IncomingBytes + h.OutgoingBytes + h.BackendBytes,
 	}
 
 	// Ensure the directory exists
@@ -403,6 +444,13 @@ func (h *Handle) loadStats() error {
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&allStats); err != nil {
 		return fmt.Errorf("failed to decode stats: %v", err)
+	}
+
+	// Compute GB for all stats
+	for _, data := range allStats.DailyStats {
+		if data != nil {
+			data.TotalBytes = data.IncomingBytes + data.OutgoingBytes + data.BackendBytes
+		}
 	}
 
 	// Load today's stats if available
