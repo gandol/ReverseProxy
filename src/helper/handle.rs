@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use chrono::Local;
 use http_body_util::Full;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
 use rand::Rng;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -376,12 +377,173 @@ impl Handle {
         let used_remote = self.server_manager.get_server();
         println!("Using remote server: {}", used_remote);
 
-        // TODO: Implement actual proxy logic here
-        // For now, return a placeholder response
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("Proxy response placeholder")))
-            .unwrap())
+        // Build the full URL for the backend
+        let backend_url = format!("{}{}", used_remote, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+
+        // Create HTTP client with optional SOCKS proxy
+        let client = self.build_http_client()?;
+
+        // Forward the request
+        match self.forward_request(&client, req, &backend_url).await {
+            Ok(response) => {
+                // Check response status code for failover
+                let status = response.status();
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    println!("Server returned 429 - Too Many Requests");
+                    self.server_manager.mark_server_as_failed(&used_remote);
+                } else if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND {
+                    println!(
+                        "Remote server returned status code {} for URL: {}",
+                        status.as_u16(),
+                        backend_url
+                    );
+                }
+                Ok(response)
+            }
+            Err(e) => {
+                eprintln!("Error forwarding request: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Full::new(Bytes::from("Bad Gateway")))
+                    .unwrap())
+            }
+        }
+    }
+
+    fn build_http_client(&self) -> Result<Client> {
+        let mut builder = Client::builder();
+
+        // Configure SOCKS proxy if provided
+        if !self.socks_proxy.is_empty() {
+            // Try to parse as URL format first, then custom format
+            if let Ok(proxy) = reqwest::Proxy::all(&self.socks_proxy) {
+                builder = builder.proxy(proxy);
+                println!("Configured SOCKS proxy: {}", self.socks_proxy);
+            } else {
+                // Try custom format: type:host:port:username:password
+                if let Some(proxy_url) = self.parse_custom_socks_format(&self.socks_proxy) {
+                    if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                        builder = builder.proxy(proxy);
+                        println!("Configured SOCKS proxy (custom format): {}", proxy_url);
+                    }
+                }
+            }
+        }
+
+        Ok(builder.build()?)
+    }
+
+    fn parse_custom_socks_format(&self, socks_config: &str) -> Option<String> {
+        let parts: Vec<&str> = socks_config.split(':').collect();
+        if parts.len() != 5 {
+            return None;
+        }
+
+        let socks_type = parts[0];
+        let host = parts[1];
+        let port = parts[2];
+        let username = parts[3];
+        let password = parts[4];
+
+        if socks_type != "socks5" && socks_type != "socks4" && socks_type != "socks4a" {
+            return None;
+        }
+
+        // Build URL format
+        if !username.is_empty() && !password.is_empty() {
+            Some(format!(
+                "{}://{}:{}@{}:{}",
+                socks_type, username, password, host, port
+            ))
+        } else {
+            Some(format!("{}://{}:{}", socks_type, host, port))
+        }
+    }
+
+    async fn forward_request(
+        &self,
+        client: &Client,
+        req: Request<Incoming>,
+        backend_url: &str,
+    ) -> Result<Response<Full<Bytes>>> {
+        // Parse the backend URL
+        let uri: Uri = backend_url.parse()?;
+
+        // Build the reqwest request
+        let method = match *req.method() {
+            Method::GET => reqwest::Method::GET,
+            Method::POST => reqwest::Method::POST,
+            Method::PUT => reqwest::Method::PUT,
+            Method::DELETE => reqwest::Method::DELETE,
+            Method::HEAD => reqwest::Method::HEAD,
+            Method::OPTIONS => reqwest::Method::OPTIONS,
+            Method::PATCH => reqwest::Method::PATCH,
+            _ => reqwest::Method::GET,
+        };
+
+        let mut request_builder = client.request(method, uri.to_string());
+
+        // Add custom headers if specified
+        if !self.headers.is_empty() {
+            for header in self.headers.split(';') {
+                if let Some((key, value)) = header.split_once(':') {
+                    let key = key.trim();
+                    let value = value.trim();
+                    if !key.is_empty() && !value.is_empty() {
+                        request_builder = request_builder.header(key, value);
+                    }
+                }
+            }
+        }
+
+        // Copy headers from the incoming request (except Host)
+        for (key, value) in req.headers().iter() {
+            if key != hyper::header::HOST {
+                if let Ok(value_str) = value.to_str() {
+                    request_builder = request_builder.header(key.as_str(), value_str);
+                }
+            }
+        }
+
+        // Read the body if present
+        let body_bytes = if req.body().size_hint().lower() > 0 {
+            use http_body_util::BodyExt;
+            let collected = req.collect().await?;
+            let body = collected.to_bytes();
+            *self.incoming_bytes.write() += body.len() as i64;
+            Some(body)
+        } else {
+            None
+        };
+
+        // Add body to request if present
+        if let Some(body) = body_bytes {
+            request_builder = request_builder.body(body);
+        }
+
+        // Send the request
+        let response = request_builder.send().await?;
+
+        // Count backend bytes
+        let status = response.status();
+        let headers = response.headers().clone();
+
+        // Read response body
+        let body_bytes = response.bytes().await?;
+        *self.backend_bytes.write() += body_bytes.len() as i64;
+        *self.outgoing_bytes.write() += body_bytes.len() as i64;
+
+        // Build hyper response
+        let mut resp_builder = Response::builder().status(status.as_u16());
+
+        // Copy response headers
+        for (key, value) in headers.iter() {
+            if let Ok(value_str) = value.to_str() {
+                resp_builder = resp_builder.header(key.as_str(), value_str);
+            }
+        }
+
+        Ok(resp_builder.body(Full::new(body_bytes))?)
     }
 
     fn is_blocked_file(&self, path: &str) -> bool {

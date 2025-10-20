@@ -3,6 +3,7 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "proxyrust")]
 #[command(about = "ReverseProxy in Rust with traffic calculation and daily statistics")]
+#[command(disable_help_flag = true)]
 pub struct Cmd {
     /// Listen on ip:port
     #[arg(short = 'l', long, default_value = "0.0.0.0:8888")]
@@ -17,7 +18,7 @@ pub struct Cmd {
     pub ip: String,
 
     /// Custom headers to add to requests
-    #[arg(short = 'h', long, default_value = "")]
+    #[arg(short = 'h', long = "headers", default_value = "")]
     pub headers: String,
 
     /// Block file extensions (e.g., exe|zip)
@@ -31,6 +32,10 @@ pub struct Cmd {
     /// SOCKS proxy address (URL format: socks5://user:pass@host:port or custom format: socks5:host:port:username:password)
     #[arg(long = "socks", default_value = "")]
     pub socks_proxy: String,
+
+    /// Print help information
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    help: Option<bool>,
 }
 
 pub fn parse_cmd() -> Cmd {
