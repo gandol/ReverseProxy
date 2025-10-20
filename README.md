@@ -1,6 +1,8 @@
 # ReverseProxy
 ReverseProxy in golang with traffic calculation and daily statistics
 
+**🦀 Rust Implementation Available!** - A full Rust rewrite is now available on the `copilot/rewrite-feature-in-rust` branch. See [RUST_README.md](RUST_README.md) for details.
+
 ## Features:
 - Reverse proxy functionality
 - **Daily traffic statistics tracking with date separation**
@@ -190,4 +192,38 @@ Logs are written to `proxy.log` when running in daemon mode.
 - `GET /stats` - Current day statistics
 - `GET /stats/history` - All historical statistics by date
 - `POST /stats/reset` - Reset current day statistics
+
+## Rust Implementation
+
+A complete Rust implementation is available with identical functionality and command-line interface. The Rust version offers:
+
+- **Better Performance**: Lower memory footprint and better performance under high load
+- **Memory Safety**: Rust's guarantees prevent common memory-related bugs
+- **Same Interface**: All command-line flags and APIs remain identical
+- **Enhanced Safety**: Compile-time checks prevent many runtime errors
+
+### Building the Rust Version
+
+```bash
+cargo build --release
+```
+
+The compiled binary will be at `./target/release/proxyrust`.
+
+### Running the Rust Version
+
+All commands work exactly the same as the Go version:
+
+```bash
+# Standard mode
+./target/release/proxyrust -l "0.0.0.0:8081" -r "https://www.baidu.com"
+
+# Daemon mode
+./target/release/proxyrust -d -l "0.0.0.0:8081" -r "https://www.baidu.com"
+
+# With SOCKS proxy
+./target/release/proxyrust -l "0.0.0.0:8081" -r "https://www.baidu.com" --socks "socks5://127.0.0.1:1080"
+```
+
+For complete Rust documentation, see [RUST_README.md](RUST_README.md).
 

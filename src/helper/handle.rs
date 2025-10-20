@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+use url::Url;
 
 // Stats data structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,13 +429,24 @@ impl Handle {
             // Try to parse as URL format first, then custom format
             if let Ok(proxy) = reqwest::Proxy::all(&self.socks_proxy) {
                 builder = builder.proxy(proxy);
-                println!("Configured SOCKS proxy: {}", self.socks_proxy);
+                // Extract and log only the host:port part without credentials
+                if let Ok(url) = self.socks_proxy.parse::<url::Url>() {
+                    println!("Configured SOCKS proxy: {}://{}", url.scheme(), url.host_str().unwrap_or("unknown"));
+                } else {
+                    println!("Configured SOCKS proxy (masked)");
+                }
             } else {
                 // Try custom format: type:host:port:username:password
                 if let Some(proxy_url) = self.parse_custom_socks_format(&self.socks_proxy) {
                     if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
                         builder = builder.proxy(proxy);
-                        println!("Configured SOCKS proxy (custom format): {}", proxy_url);
+                        // Log only the type and host without credentials
+                        let parts: Vec<&str> = self.socks_proxy.split(':').collect();
+                        if parts.len() >= 3 {
+                            println!("Configured SOCKS proxy (custom format): {}://{}:{}", parts[0], parts[1], parts[2]);
+                        } else {
+                            println!("Configured SOCKS proxy (custom format, masked)");
+                        }
                     }
                 }
             }
