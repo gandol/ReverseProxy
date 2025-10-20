@@ -378,7 +378,17 @@ impl Handle {
         println!("Using remote server: {}", used_remote);
 
         // Build the full URL for the backend
-        let backend_url = format!("{}{}", used_remote, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+        let uri_str = req.uri().path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        
+        let backend_url = if used_remote.ends_with('/') && uri_str.starts_with('/') {
+            format!("{}{}", used_remote.trim_end_matches('/'), uri_str)
+        } else if !used_remote.ends_with('/') && !uri_str.starts_with('/') {
+            format!("{}/{}", used_remote, uri_str)
+        } else {
+            format!("{}{}", used_remote, uri_str)
+        };
 
         // Create HTTP client with optional SOCKS proxy
         let client = self.build_http_client()?;
@@ -401,10 +411,10 @@ impl Handle {
                 Ok(response)
             }
             Err(e) => {
-                eprintln!("Error forwarding request: {}", e);
+                eprintln!("Error forwarding request to {}: {:?}", backend_url, e);
                 Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from("Bad Gateway")))
+                    .body(Full::new(Bytes::from(format!("Bad Gateway: {}", e))))
                     .unwrap())
             }
         }
