@@ -422,7 +422,8 @@ impl Handle {
     }
 
     fn build_http_client(&self) -> Result<Client> {
-        let mut builder = Client::builder();
+        let mut builder = Client::builder()
+            .danger_accept_invalid_certs(true);
 
         // Configure SOCKS proxy if provided
         if !self.socks_proxy.is_empty() {
