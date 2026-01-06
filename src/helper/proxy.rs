@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, StreamBody};
 use http_body_util::combinators::BoxBody;
-use hyper::body::{Body, Frame, Incoming};
+use hyper::body::{Frame, Incoming};
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -127,7 +127,8 @@ impl ProxyHandler {
     fn build_http_client(socks_proxy: &str) -> Result<Client, anyhow::Error> {
         let mut builder = Client::builder()
             .danger_accept_invalid_certs(true)
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .pool_idle_timeout(Some(Duration::from_secs(15)))
+            .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(32);
 
         if !socks_proxy.is_empty() {
@@ -269,7 +270,9 @@ impl ProxyHandler {
     ) -> Result<Response<BoxBody<Bytes, BoxError>>, anyhow::Error> {
         let uri: Uri = backend_url.parse()?;
         
-        let method = match *req.method() {
+        let (parts, body) = req.into_parts();
+        
+        let method = match parts.method {
             Method::GET => reqwest::Method::GET,
             Method::POST => reqwest::Method::POST,
             Method::PUT => reqwest::Method::PUT,
@@ -280,61 +283,74 @@ impl ProxyHandler {
             _ => reqwest::Method::GET,
         };
 
-        let mut request_builder = self.client.request(method, uri.to_string());
+        // Buffer the body to allow retries
+        // Note: For very large files this might be an issue, but for normal API/Web use it handles the retry requirement
+        let body_bytes = body.collect().await?.to_bytes();
+        self.stats.get_incoming_counter().fetch_add(body_bytes.len() as i64, Ordering::Relaxed);
 
-        for (k, v) in self.parsed_headers.iter() {
-            request_builder = request_builder.header(k, v);
-        }
+        let max_retries = 3;
+        let mut last_error = None;
 
-        for (key, value) in req.headers().iter() {
-            if key != hyper::header::HOST {
-                 request_builder = request_builder.header(key, value);
+        for attempt in 0..max_retries {
+            let mut request_builder = self.client.request(method.clone(), uri.to_string());
+
+            for (k, v) in self.parsed_headers.iter() {
+                request_builder = request_builder.header(k, v);
+            }
+
+            for (key, value) in parts.headers.iter() {
+                if key != hyper::header::HOST {
+                     request_builder = request_builder.header(key, value);
+                }
+            }
+
+            // Use the buffered body
+            let req_body = reqwest::Body::from(body_bytes.clone());
+            request_builder = request_builder.body(req_body);
+
+            match request_builder.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let headers = response.headers().clone();
+
+                    // Stream Response Body
+                    let outgoing_counter = self.stats.get_outgoing_counter();
+                    let backend_counter = self.stats.get_backend_counter();
+                    
+                    let stream = response.bytes_stream().map(move |result| {
+                        match result {
+                            Ok(bytes) => {
+                                let len = bytes.len() as i64;
+                                outgoing_counter.fetch_add(len, Ordering::Relaxed);
+                                backend_counter.fetch_add(len, Ordering::Relaxed);
+                                Ok(Frame::data(bytes))
+                            },
+                            Err(e) => Err(Box::new(e) as BoxError),
+                        }
+                    });
+
+                    let body = BodyExt::boxed(StreamBody::new(stream));
+
+                    let mut resp_builder = Response::builder().status(status.as_u16());
+                    for (key, value) in headers.iter() {
+                         resp_builder = resp_builder.header(key, value);
+                    }
+
+                    return Ok(resp_builder.body(body)?);
+                }
+                Err(e) => {
+                    println!("Request to {} failed (attempt {}/{}): {}", backend_url, attempt + 1, max_retries, e);
+                    last_error = Some(e);
+                    if attempt < max_retries - 1 {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
             }
         }
 
-        // Stream Request Body
-        let (parts, body) = req.into_parts();
-        let incoming_counter = self.stats.get_incoming_counter();
-        
-        // Fix: Use Box::new(e) to match BoxError type
-        let counted_body = body.map_frame(move |frame| {
-            let frame = frame;
-            if let Some(data) = frame.data_ref() {
-                incoming_counter.fetch_add(data.len() as i64, Ordering::Relaxed);
-            }
-            frame
-        }).map_err(|e| Box::new(e) as BoxError);
-
-        let req_body = reqwest::Body::wrap(counted_body);
-        request_builder = request_builder.body(req_body);
-
-        let response = request_builder.send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-
-        // Stream Response Body
-        let outgoing_counter = self.stats.get_outgoing_counter();
-        let backend_counter = self.stats.get_backend_counter();
-        
-        let stream = response.bytes_stream().map(move |result| {
-            match result {
-                Ok(bytes) => {
-                    let len = bytes.len() as i64;
-                    outgoing_counter.fetch_add(len, Ordering::Relaxed);
-                    backend_counter.fetch_add(len, Ordering::Relaxed);
-                    Ok(Frame::data(bytes))
-                },
-                Err(e) => Err(Box::new(e) as BoxError),
-            }
-        });
-
-        let body = BodyExt::boxed(StreamBody::new(stream));
-
-        let mut resp_builder = Response::builder().status(status.as_u16());
-        for (key, value) in headers.iter() {
-             resp_builder = resp_builder.header(key, value);
+        if let Some(e) = last_error {
+            return Err(e.into());
         }
-
-        Ok(resp_builder.body(body)?)
+        Err(anyhow::anyhow!("Request failed after retries"))
     }
 }
