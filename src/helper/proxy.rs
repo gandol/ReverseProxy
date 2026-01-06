@@ -128,8 +128,8 @@ impl ProxyHandler {
         let mut builder = Client::builder()
             .danger_accept_invalid_certs(true)
             .pool_idle_timeout(Some(Duration::from_secs(15)))
-            .connect_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(32);
+            .connect_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(128);
 
         if !socks_proxy.is_empty() {
             if let Ok(proxy) = reqwest::Proxy::all(socks_proxy) {
