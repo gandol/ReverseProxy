@@ -21,3 +21,9 @@ bytes = "1.8"
 rand = "0.8"
 url = "2.5"
 futures-util = "0.3.31"
+mimalloc = { version = "0.1.43", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

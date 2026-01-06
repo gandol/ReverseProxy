@@ -5,6 +5,10 @@ use daemonize::Daemonize;
 use helper::{parse_cmd, start_server};
 use std::fs::File;
 use std::process;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {

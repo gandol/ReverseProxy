@@ -11,6 +11,7 @@ use reqwest::Client;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::helper::stats::{StatsManager, BoxError};
 
@@ -75,6 +76,7 @@ pub struct ProxyHandler {
     pub parsed_headers: Arc<HeaderMap>,
     pub parsed_blocked_files: Arc<Vec<String>>,
     pub stats: Arc<StatsManager>,
+    pub log_tx: UnboundedSender<String>,
 }
 
 impl ProxyHandler {
@@ -113,6 +115,16 @@ impl ProxyHandler {
             Client::builder().build().unwrap()
         });
 
+        // Async Logger Channel
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        
+        // Spawn background logger task
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                println!("{}", msg);
+            }
+        });
+
         ProxyHandler {
             client,
             parsed_headers: Arc::new(parsed_headers),
@@ -121,7 +133,12 @@ impl ProxyHandler {
                 reverse_proxy.split('|').map(|s| s.to_string()).collect(),
             )),
             stats,
+            log_tx: tx,
         }
+    }
+
+    fn log(&self, msg: String) {
+        let _ = self.log_tx.send(msg);
     }
 
     fn build_http_client(socks_proxy: &str) -> Result<Client, anyhow::Error> {
@@ -188,7 +205,7 @@ impl ProxyHandler {
         // Increment request count
         self.stats.inc_request();
 
-        println!(
+        self.log(format!(
             "{} {} {:?} {}",
             req.uri(),
             req.method(),
@@ -197,10 +214,10 @@ impl ProxyHandler {
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
-        );
+        ));
 
         if self.is_blocked_file(&path) {
-            println!("Blocked file extension for URL: {}", path);
+            self.log(format!("Blocked file extension for URL: {}", path));
             self.stats.inc_blocked();
             let body = http_body_util::Full::new(Bytes::from("Forbidden"))
                 .map_err(|never| match never {})
@@ -212,7 +229,7 @@ impl ProxyHandler {
         }
 
         let used_remote = self.server_manager.get_server();
-        println!("Using remote server: {}", used_remote);
+        self.log(format!("Using remote server: {}", used_remote));
 
         let uri_str = req.uri().path_and_query()
             .map(|pq| pq.as_str())
@@ -230,13 +247,13 @@ impl ProxyHandler {
             Ok(response) => {
                 let status = response.status();
                 if status == StatusCode::TOO_MANY_REQUESTS {
-                    println!("Server returned 429 - Too Many Requests");
+                    self.log("Server returned 429 - Too Many Requests".to_string());
                     self.server_manager.mark_server_as_failed(&used_remote);
                 }
                 Ok(response)
             }
             Err(e) => {
-                eprintln!("Error forwarding request to {}: {:?}", backend_url, e);
+                self.log(format!("Error forwarding request to {}: {:?}", backend_url, e));
                 let body = http_body_util::Full::new(Bytes::from(format!("Bad Gateway: {}", e)))
                     .map_err(|never| match never {})
                     .boxed();
@@ -339,7 +356,7 @@ impl ProxyHandler {
                     return Ok(resp_builder.body(body)?);
                 }
                 Err(e) => {
-                    println!("Request to {} failed (attempt {}/{}): {}", backend_url, attempt + 1, max_retries, e);
+                    self.log(format!("Request to {} failed (attempt {}/{}): {}", backend_url, attempt + 1, max_retries, e));
                     last_error = Some(e);
                     if attempt < max_retries - 1 {
                         tokio::time::sleep(Duration::from_millis(500)).await;
