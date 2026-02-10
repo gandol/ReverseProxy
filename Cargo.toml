@@ -1,0 +1,29 @@
+[package]
+name = "proxyrust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.41", features = ["full"] }
+hyper = { version = "1.5", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["socks", "stream"] }
+trust-dns-resolver = "0.23"
+daemonize = "0.5"
+parking_lot = "0.12"
+anyhow = "1.0"
+bytes = "1.8"
+rand = "0.8"
+url = "2.5"
+futures-util = "0.3.31"
+mimalloc = { version = "0.1.43", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
