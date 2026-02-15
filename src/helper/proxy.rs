@@ -11,7 +11,7 @@ use reqwest::Client;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, Sender};
 
 use crate::helper::stats::{StatsManager, BoxError};
 
@@ -69,6 +69,8 @@ impl ServerManager {
     }
 }
 
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
 #[derive(Clone)]
 pub struct ProxyHandler {
     pub client: Client,
@@ -76,7 +78,7 @@ pub struct ProxyHandler {
     pub parsed_headers: Arc<HeaderMap>,
     pub parsed_blocked_files: Arc<Vec<String>>,
     pub stats: Arc<StatsManager>,
-    pub log_tx: UnboundedSender<String>,
+    pub log_tx: Sender<String>,
 }
 
 impl ProxyHandler {
@@ -115,8 +117,8 @@ impl ProxyHandler {
             Client::builder().build().unwrap()
         });
 
-        // Async Logger Channel
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        // Async Logger Channel (bounded to prevent memory growth)
+        let (tx, mut rx) = mpsc::channel::<String>(1000);
         
         // Spawn background logger task
         tokio::spawn(async move {
@@ -138,7 +140,7 @@ impl ProxyHandler {
     }
 
     fn log(&self, msg: String) {
-        let _ = self.log_tx.send(msg);
+        let _ = self.log_tx.try_send(msg);
     }
 
     fn build_http_client(socks_proxy: &str) -> Result<Client, anyhow::Error> {
@@ -303,6 +305,16 @@ impl ProxyHandler {
         // Buffer the body to allow retries
         // Note: For very large files this might be an issue, but for normal API/Web use it handles the retry requirement
         let body_bytes = body.collect().await?.to_bytes();
+        if body_bytes.len() > MAX_BODY_SIZE {
+            self.log(format!("Request body too large: {} bytes (max {})", body_bytes.len(), MAX_BODY_SIZE));
+            let body = http_body_util::Full::new(Bytes::from("Request Entity Too Large"))
+                .map_err(|never| match never {})
+                .boxed();
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(body)
+                .unwrap());
+        }
         self.stats.get_incoming_counter().fetch_add(body_bytes.len() as i64, Ordering::Relaxed);
 
         let max_retries = 3;

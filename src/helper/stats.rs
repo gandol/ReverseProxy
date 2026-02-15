@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+const STATS_RETENTION_DAYS: i64 = 30;
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 // Stats data structures
@@ -145,7 +147,7 @@ impl StatsManager {
 
         let (req_count, in_bytes, out_bytes, backend_bytes, blocked_count) = self.get_stats();
         all_stats.daily_stats.insert(
-            today,
+            today.clone(),
             DailyStatsData {
                 requests: req_count,
                 incoming_bytes: in_bytes,
@@ -155,6 +157,11 @@ impl StatsManager {
                 total_bytes: in_bytes + out_bytes + backend_bytes,
             },
         );
+
+        // Retention: remove entries older than STATS_RETENTION_DAYS
+        let cutoff = Local::now() - chrono::Duration::days(STATS_RETENTION_DAYS);
+        let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
+        all_stats.daily_stats.retain(|date, _| date >= &cutoff_str);
 
         if let Some(parent) = Path::new(&self.stats_file).parent() {
             std::fs::create_dir_all(parent)?;
